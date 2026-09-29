@@ -25,4 +25,6 @@ jobs:
         run: python -m compileall -q app
 
       - name: Run tests
+        env:
+          PYTHONPATH: ${{ github.workspace }}
         run: pytest -q
