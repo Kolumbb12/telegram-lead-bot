@@ -8,18 +8,14 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, Message, ReplyKeyboardRemove
 
 from .database import Database
-from .keyboards import confirmation_menu, main_menu, phone_keyboard, service_menu
+from .keyboards import confirmation_menu, language_menu, main_menu, phone_keyboard, service_menu
+from .localization import SERVICES, all_button_values, service_name, text
 from .states import LeadForm
 
 logger = logging.getLogger(__name__)
 router = Router()
-SERVICE_NAMES = {
-    "bot": "Telegram-бот",
-    "automation": "Автоматизация",
-    "parsing": "Парсинг данных",
-    "other": "Другое",
-}
 MAX_LEAD_PREVIEW_LENGTH = 500
+MAX_MESSAGE_LENGTH = 3800
 
 
 def is_admin(message: Message, admin_ids: tuple[int, ...]) -> bool:
@@ -36,150 +32,215 @@ def normalize_phone(value: str) -> str:
     return f"+{digits}" if value.lstrip().startswith("+") else digits
 
 
-def lead_preview(comment: str) -> str:
-    """Keep admin list messages safely under Telegram's message length limit."""
-    return comment if len(comment) <= MAX_LEAD_PREVIEW_LENGTH else f"{comment[:MAX_LEAD_PREVIEW_LENGTH - 1]}…"
+def escaped_preview(value: str, limit: int) -> str:
+    """Escape and truncate content without cutting an HTML entity in half."""
+    parts: list[str] = []
+    length = 0
+    for character in value:
+        encoded = escape(character)
+        if length + len(encoded) > limit:
+            return "".join(parts) + "…"
+        parts.append(encoded)
+        length += len(encoded)
+    return "".join(parts)
 
 
 def format_created_at(value: str) -> str:
-    """Present stored UTC timestamps in a compact readable form."""
     return value[:16].replace("T", " ") + " UTC"
 
 
-async def begin_lead(message: Message, state: FSMContext) -> None:
+async def form_language(state: FSMContext, database: Database, user_id: int) -> str:
+    data = await state.get_data()
+    return str(data.get("language") or await database.get_language(user_id))
+
+
+async def send_lead_list(message: Message, language: str, rows: list[dict[str, object]]) -> None:
+    """Split the lead list into Telegram-safe HTML messages when needed."""
+    header = text(language, "latest_leads")
+    current = header
+    for row in rows:
+        block = (
+            f"\n\n<b>#{row['id']} · {escape(format_created_at(str(row['created_at'])))}</b>"
+            f"\n{escaped_preview(str(row['name']), 200)} — {escape(service_name(str(row['service']), language))}"
+            f"\n{text(language, 'phone_label')}: {escaped_preview(str(row['phone']), 100)}"
+            f"\n{escaped_preview(str(row['comment']), MAX_LEAD_PREVIEW_LENGTH)}"
+        )
+        if len(current) + len(block) > MAX_MESSAGE_LENGTH and current != header:
+            await message.answer(current, parse_mode="HTML")
+            current = header
+        current += block
+    await message.answer(current, parse_mode="HTML")
+
+
+async def begin_lead(message: Message, state: FSMContext, database: Database) -> None:
+    language = await database.get_language(message.from_user.id)
     await state.clear()
+    await state.update_data(language=language)
     await state.set_state(LeadForm.service)
-    await message.answer("Выберите услугу:", reply_markup=service_menu())
+    await message.answer(text(language, "choose_service"), reply_markup=service_menu(language))
 
 
 @router.message(CommandStart())
-async def start(message: Message, state: FSMContext) -> None:
+async def start(message: Message, state: FSMContext, database: Database) -> None:
+    language = await database.get_language(message.from_user.id)
     await state.clear()
-    await message.answer("Здравствуйте! Я помогу оставить заявку на разработку или автоматизацию.", reply_markup=main_menu())
+    await message.answer(text(language, "welcome"), reply_markup=main_menu(language))
 
 
 @router.message(Command("help"))
-async def help_command(message: Message) -> None:
-    await message.answer("Чтобы оставить заявку, нажмите «📝 Оставить заявку» и последовательно заполните форму. Для отмены используйте /cancel.", reply_markup=main_menu())
+async def help_command(message: Message, database: Database) -> None:
+    language = await database.get_language(message.from_user.id)
+    await message.answer(text(language, "help"), reply_markup=main_menu(language))
+
+
+@router.message(Command("language"))
+@router.message(F.text.in_(all_button_values("language")))
+async def choose_language(message: Message) -> None:
+    await message.answer("Choose your language / Выберите язык:", reply_markup=language_menu())
+
+
+@router.callback_query(F.data.in_({"language:en", "language:ru"}))
+async def save_language(callback: CallbackQuery, state: FSMContext, database: Database) -> None:
+    language = callback.data.rsplit(":", 1)[1]
+    await database.set_language(callback.from_user.id, language)
+    await state.clear()
+    await callback.answer()
+    await callback.message.answer(text(language, "language_saved"), reply_markup=main_menu(language))
 
 
 @router.message(Command("cancel"))
-async def cancel(message: Message, state: FSMContext) -> None:
+async def cancel(message: Message, state: FSMContext, database: Database) -> None:
+    language = await form_language(state, database, message.from_user.id)
     await state.clear()
-    await message.answer("Заполнение заявки отменено.", reply_markup=main_menu())
+    await message.answer(text(language, "cancelled"), reply_markup=main_menu(language))
 
 
 @router.message(Command("leads"))
 async def leads(message: Message, database: Database, admin_ids: tuple[int, ...]) -> None:
     if not is_admin(message, admin_ids):
         return
+    language = await database.get_language(message.from_user.id)
     rows = await database.get_latest()
     if not rows:
-        await message.answer("Заявок пока нет.")
+        await message.answer(text(language, "no_leads"))
         return
 
-    lines = ["<b>Последние заявки:</b>"]
-    for row in rows:
-        lines.append(
-            f"\n<b>#{row['id']} · {escape(format_created_at(row['created_at']))}</b>"
-            f"\n{escape(row['name'])} — {escape(row['service'])}"
-            f"\nТелефон: {escape(row['phone'])}"
-            f"\n{escape(lead_preview(row['comment']))}"
-        )
-    await message.answer("\n".join(lines), parse_mode="HTML")
+    await send_lead_list(message, language, rows)
 
 
 @router.message(Command("stats"))
 async def stats(message: Message, database: Database, admin_ids: tuple[int, ...]) -> None:
     if not is_admin(message, admin_ids):
         return
+    language = await database.get_language(message.from_user.id)
     total, services = await database.get_stats()
-    details = "\n".join(f"• {escape(service)}: {count}" for service, count in services) or "Нет данных по услугам"
-    await message.answer(f"<b>Статистика заявок</b>\n\nВсего: {total}\n\n{details}", parse_mode="HTML")
+    details = "\n".join(
+        f"• {escape(service_name(service, language))}: {count}" for service, count in services
+    ) or text(language, "no_service_data")
+    await message.answer(text(language, "statistics", total=total, details=details), parse_mode="HTML")
 
 
-@router.message(F.text == "📝 Оставить заявку")
-async def start_lead(message: Message, state: FSMContext) -> None:
-    await begin_lead(message, state)
+@router.message(F.text.in_(all_button_values("lead")))
+async def start_lead(message: Message, state: FSMContext, database: Database) -> None:
+    await begin_lead(message, state, database)
 
 
-@router.message(F.text == "ℹ️ О боте")
-async def about(message: Message) -> None:
-    await message.answer("Этот бот собирает заявки и передаёт их администратору. /help — справка.", reply_markup=main_menu())
+@router.message(F.text.in_(all_button_values("about")))
+async def about(message: Message, database: Database) -> None:
+    language = await database.get_language(message.from_user.id)
+    await message.answer(text(language, "about"), reply_markup=main_menu(language))
 
 
 @router.callback_query(LeadForm.service, F.data.startswith("service:"))
-async def choose_service(callback: CallbackQuery, state: FSMContext) -> None:
-    key = callback.data.split(":", 1)[1]
-    await state.update_data(service=SERVICE_NAMES.get(key, "Другое"))
+async def choose_service(callback: CallbackQuery, state: FSMContext, database: Database) -> None:
+    service = callback.data.split(":", 1)[1]
+    language = await form_language(state, database, callback.from_user.id)
+    if service not in SERVICES["en"]:
+        await callback.answer(text(language, "stale_option"), show_alert=True)
+        return
+    await state.update_data(service=service)
     await state.set_state(LeadForm.name)
     await callback.answer()
-    await callback.message.answer("Как вас зовут?")
+    await callback.message.answer(text(language, "ask_name"))
 
 
 @router.message(LeadForm.name, F.text)
-async def get_name(message: Message, state: FSMContext) -> None:
+async def get_name(message: Message, state: FSMContext, database: Database) -> None:
+    language = await form_language(state, database, message.from_user.id)
     name = message.text.strip()
     if not 2 <= len(name) <= 100:
-        await message.answer("Введите имя длиной от 2 до 100 символов.")
+        await message.answer(text(language, "invalid_name"))
         return
     await state.update_data(name=name)
     await state.set_state(LeadForm.phone)
-    await message.answer("Укажите номер телефона или воспользуйтесь кнопкой ниже:", reply_markup=phone_keyboard())
+    await message.answer(text(language, "ask_phone"), reply_markup=phone_keyboard(language))
 
 
 @router.message(LeadForm.phone, F.contact)
-async def get_contact(message: Message, state: FSMContext) -> None:
+async def get_contact(message: Message, state: FSMContext, database: Database) -> None:
+    language = await form_language(state, database, message.from_user.id)
     if message.contact.user_id and message.contact.user_id != message.from_user.id:
-        await message.answer("Отправьте свой контакт или введите номер вручную.")
+        await message.answer(text(language, "foreign_contact"))
         return
-    await save_phone(message, state, message.contact.phone_number)
+    await save_phone(message, state, language, message.contact.phone_number)
 
 
 @router.message(LeadForm.phone, F.text)
-async def get_phone(message: Message, state: FSMContext) -> None:
-    await save_phone(message, state, message.text.strip())
+async def get_phone(message: Message, state: FSMContext, database: Database) -> None:
+    language = await form_language(state, database, message.from_user.id)
+    await save_phone(message, state, language, message.text.strip())
 
 
-async def save_phone(message: Message, state: FSMContext, phone: str) -> None:
+async def save_phone(message: Message, state: FSMContext, language: str, phone: str) -> None:
     if not valid_phone(phone):
-        await message.answer("Не удалось распознать номер. Введите номер длиной от 10 до 15 цифр.")
+        await message.answer(text(language, "invalid_phone"))
         return
     await state.update_data(phone=normalize_phone(phone))
     await state.set_state(LeadForm.comment)
-    await message.answer("Кратко опишите вашу задачу:", reply_markup=ReplyKeyboardRemove())
+    await message.answer(text(language, "ask_comment"), reply_markup=ReplyKeyboardRemove())
 
 
 @router.message(LeadForm.comment, F.text)
-async def get_comment(message: Message, state: FSMContext) -> None:
+async def get_comment(message: Message, state: FSMContext, database: Database) -> None:
+    language = await form_language(state, database, message.from_user.id)
     comment = message.text.strip()
     if not 3 <= len(comment) <= 2000:
-        await message.answer("Описание должно содержать от 3 до 2000 символов.")
+        await message.answer(text(language, "invalid_comment"))
         return
     await state.update_data(comment=comment)
     data = await state.get_data()
     await state.set_state(LeadForm.confirmation)
     await message.answer(
-        f"<b>Новая заявка</b>\n\nИмя: {escape(data['name'])}\nУслуга: {escape(data['service'])}\nТелефон: {escape(data['phone'])}\nКомментарий: {escape(data['comment'])}",
-        reply_markup=confirmation_menu(), parse_mode="HTML",
+        text(
+            language,
+            "lead_summary",
+            name=escaped_preview(data["name"], 300),
+            service=escape(service_name(data["service"], language)),
+            phone=escaped_preview(data["phone"], 100),
+            comment=escaped_preview(data["comment"], 2500),
+        ),
+        reply_markup=confirmation_menu(language),
+        parse_mode="HTML",
     )
 
 
 @router.callback_query(LeadForm.confirmation, F.data == "lead:restart")
-async def restart(callback: CallbackQuery, state: FSMContext) -> None:
+async def restart(callback: CallbackQuery, state: FSMContext, database: Database) -> None:
     await callback.answer()
-    await begin_lead(callback.message, state)
+    await begin_lead(callback.message, state, database)
 
 
 @router.callback_query(LeadForm.confirmation, F.data == "lead:cancel")
-async def cancel_callback(callback: CallbackQuery, state: FSMContext) -> None:
+async def cancel_callback(callback: CallbackQuery, state: FSMContext, database: Database) -> None:
+    language = await form_language(state, database, callback.from_user.id)
     await state.clear()
-    await callback.answer("Заявка отменена")
-    await callback.message.answer("Заявка отменена.", reply_markup=main_menu())
+    await callback.answer(text(language, "lead_cancelled"))
+    await callback.message.answer(text(language, "lead_cancelled"), reply_markup=main_menu(language))
 
 
 @router.callback_query(LeadForm.confirmation, F.data == "lead:submit")
 async def submit(callback: CallbackQuery, state: FSMContext, database: Database, admin_ids: tuple[int, ...]) -> None:
+    language = await form_language(state, database, callback.from_user.id)
     data = await state.get_data()
     user = callback.from_user
     try:
@@ -194,25 +255,30 @@ async def submit(callback: CallbackQuery, state: FSMContext, database: Database,
             }
         )
     except Exception:
-        logger.exception("Не удалось сохранить заявку пользователя %s", user.id)
-        await callback.answer("Не удалось отправить заявку", show_alert=True)
+        logger.exception("Could not save lead from user %s", user.id)
+        await callback.answer(text(language, "lead_submit_failed"), show_alert=True)
         return
 
     await state.clear()
-    await callback.answer("Заявка отправлена")
-    await callback.message.answer("✅ Заявка отправлена.\nСпасибо! С вами свяжутся после рассмотрения заявки.", reply_markup=main_menu())
-    username = f"@{user.username}" if user.username else "не указан"
-    notification = (
-        f"📩 <b>Новая заявка #{lead_id}</b>\n\n"
-        f"Имя: {escape(data['name'])}\n"
-        f"Telegram: {escape(username)} (ID: {user.id})\n"
-        f"Услуга: {escape(data['service'])}\n"
-        f"Телефон: {escape(data['phone'])}\n"
-        f"Комментарий: {escape(data['comment'])}\n"
-        f"Дата создания: {format_created_at(created_at)}"
-    )
+    await callback.answer(text(language, "lead_sent"))
+    await callback.message.answer(text(language, "lead_sent"), reply_markup=main_menu(language))
+
     for admin_id in admin_ids:
+        admin_language = await database.get_language(admin_id)
+        username = f"@{user.username}" if user.username else text(admin_language, "unknown_username")
+        notification = text(
+            admin_language,
+            "admin_lead",
+            lead_id=lead_id,
+            name=escaped_preview(data["name"], 300),
+            username=escape(username),
+            user_id=user.id,
+            service=escape(service_name(data["service"], admin_language)),
+            phone=escaped_preview(data["phone"], 100),
+            comment=escaped_preview(data["comment"], 2500),
+            created_at=escape(format_created_at(created_at)),
+        )
         try:
             await callback.bot.send_message(admin_id, notification, parse_mode="HTML")
         except Exception:
-            logger.exception("Не удалось отправить уведомление администратору о заявке #%s", lead_id)
+            logger.exception("Could not notify administrator about lead #%s", lead_id)
