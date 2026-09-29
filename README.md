@@ -87,6 +87,17 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
+### Continuous deployment to Oracle Cloud Always Free
+
+This repository includes a CD workflow for an Oracle Cloud Always Free VM. It keeps the polling bot running through a systemd user service and deploys each push to `main` after the following one-time setup:
+
+1. Create an Ubuntu VM in the Oracle Cloud Always Free tier and allow SSH access only from trusted IP addresses.
+2. SSH into the VM, clone this repository to `~/apps/telegram-lead-bot`, create `.env` from `.env.example`, add the production values, then run `deploy/bootstrap.sh`.
+3. Run `sudo loginctl enable-linger $USER` once on the VM so the user service remains active after logout.
+4. Add these GitHub Actions repository secrets: `DEPLOY_HOST`, `DEPLOY_USER`, `DEPLOY_SSH_KEY` and `DEPLOY_KNOWN_HOSTS`.
+
+Use `ssh-keyscan -H YOUR_SERVER_IP` from a trusted machine to obtain the value for `DEPLOY_KNOWN_HOSTS`. The workflow syncs source code but deliberately excludes `.env`, SQLite files and virtual environments. The deploy job stays skipped until all four secrets are configured.
+
 ---
 
 ## Русский
@@ -173,3 +184,14 @@ SQLite-база и нужные таблицы создаются автомат
 pip install -r requirements-dev.txt
 pytest -q
 ```
+
+### Continuous deployment в Oracle Cloud Always Free
+
+В репозитории есть CD-пайплайн для VM Oracle Cloud Always Free. Бот работает как systemd user service, а каждый push в `main` разворачивает новую версию после однократной настройки:
+
+1. Создайте Ubuntu VM в Oracle Cloud Always Free и разрешите SSH только с доверенных IP-адресов.
+2. Подключитесь к VM по SSH, склонируйте репозиторий в `~/apps/telegram-lead-bot`, создайте `.env` из `.env.example`, добавьте production-значения и запустите `deploy/bootstrap.sh`.
+3. Один раз выполните на VM `sudo loginctl enable-linger $USER`, чтобы user service работал после выхода из SSH.
+4. Добавьте в GitHub Actions repository secrets: `DEPLOY_HOST`, `DEPLOY_USER`, `DEPLOY_SSH_KEY` и `DEPLOY_KNOWN_HOSTS`.
+
+Получите значение `DEPLOY_KNOWN_HOSTS` на доверенной машине командой `ssh-keyscan -H YOUR_SERVER_IP`. Пайплайн синхронизирует исходники, но намеренно исключает `.env`, SQLite-файлы и виртуальное окружение. Пока не настроены все четыре секрета, deploy job будет пропущен.

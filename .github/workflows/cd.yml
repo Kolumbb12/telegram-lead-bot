@@ -1,0 +1,74 @@
+name: CD
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    name: Deploy to Oracle Cloud VM
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check deployment configuration
+        id: config
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          if [[ -n "$DEPLOY_HOST" && -n "$DEPLOY_USER" && -n "$DEPLOY_SSH_KEY" && -n "$DEPLOY_KNOWN_HOSTS" ]]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Deployment skipped: configure the four DEPLOY_* repository secrets."
+          fi
+
+      - name: Check out repository
+        if: steps.config.outputs.ready == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Load deployment key
+        if: steps.config.outputs.ready == 'true'
+        uses: webfactory/ssh-agent@v0.9.1
+        with:
+          ssh-private-key: ${{ secrets.DEPLOY_SSH_KEY }}
+
+      - name: Configure trusted deployment host
+        if: steps.config.outputs.ready == 'true'
+        env:
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Sync application and restart service
+        if: steps.config.outputs.ready == 'true'
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          rsync -az --delete \
+            --exclude '.env' \
+            --exclude 'leads.db*' \
+            --exclude '.git/' \
+            --exclude '.venv/' \
+            --exclude '__pycache__/' \
+            --exclude '.pytest_cache/' \
+            ./ "$DEPLOY_USER@$DEPLOY_HOST:apps/telegram-lead-bot/"
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" \
+            'cd ~/apps/telegram-lead-bot && .venv/bin/pip install -r requirements.txt && systemctl --user restart telegram-lead-bot && systemctl --user is-active --quiet telegram-lead-bot'

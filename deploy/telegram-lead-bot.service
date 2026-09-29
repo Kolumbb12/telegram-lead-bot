@@ -1,0 +1,17 @@
+[Unit]
+Description=Telegram Lead Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/apps/telegram-lead-bot
+ExecStart=%h/apps/telegram-lead-bot/.venv/bin/python -m app.bot
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target
